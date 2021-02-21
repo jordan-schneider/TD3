@@ -1,8 +1,10 @@
 import copy
+from typing import Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.tensorboard.writer import SummaryWriter
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -72,6 +74,7 @@ class TD3(object):
         policy_noise: float = 0.2,
         noise_clip: float = 0.5,
         policy_freq: int = 2,
+        writer: Optional[SummaryWriter] = None,
     ):
 
         self.actor = Actor(state_dim, action_dim, max_action).to(device)
@@ -90,6 +93,9 @@ class TD3(object):
         self.policy_freq = policy_freq
 
         self.total_it = 0
+
+        self.writer = writer
+        self.writer_iter = 0
 
     def select_action(self, state):
         state = torch.FloatTensor(state.reshape(1, -1)).to(device)
@@ -121,6 +127,8 @@ class TD3(object):
 
         # Compute critic loss
         critic_loss = F.mse_loss(current_Q1, target_Q) + F.mse_loss(current_Q2, target_Q)
+        if self.writer is not None:
+            self.writer.add_scalar("critic_loss", critic_loss, self.writer_iter)
 
         # Optimize the critic
         self.critic_optimizer.zero_grad()
@@ -132,6 +140,8 @@ class TD3(object):
 
             # Compute actor losse
             actor_loss = -self.critic.Q1(state, self.actor(state)).mean()
+            if self.writer is not None:
+                self.writer.add_scalar("actor_loss", actor_loss, self.writer_iter)
 
             # Optimize the actor
             self.actor_optimizer.zero_grad()
@@ -146,6 +156,7 @@ class TD3(object):
 
             for param, target_param in zip(self.actor.parameters(), self.actor_target.parameters()):
                 target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
+        self.writer_iter += 1
 
     def save(self, filename: str):
         torch.save(self.critic.state_dict(), filename + "_critic")
