@@ -11,7 +11,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 class Actor(nn.Module):
-    def __init__(self, state_dim, action_dim, max_action):
+    def __init__(self, state_dim: int, action_dim: int, max_action: float):
         super(Actor, self).__init__()
 
         self.l1 = nn.Linear(state_dim, 256)
@@ -27,7 +27,7 @@ class Actor(nn.Module):
 
 
 class Critic(nn.Module):
-    def __init__(self, state_dim, action_dim):
+    def __init__(self, state_dim: int, action_dim: int):
         super(Critic, self).__init__()
 
         # Q1 architecture
@@ -64,14 +64,14 @@ class Critic(nn.Module):
 class TD3(object):
     def __init__(
         self,
-        state_dim,
-        action_dim,
-        max_action,
-        discount=0.99,
-        tau=0.005,
-        policy_noise=0.2,
-        noise_clip=0.5,
-        policy_freq=2,
+        state_dim: int,
+        action_dim: int,
+        max_action: float,
+        discount: float = 0.99,
+        tau: float = 0.005,
+        policy_noise: float = 0.2,
+        noise_clip: float = 0.5,
+        policy_freq: int = 2,
     ):
 
         self.actor = Actor(state_dim, action_dim, max_action).to(device)
@@ -95,7 +95,7 @@ class TD3(object):
         state = torch.FloatTensor(state.reshape(1, -1)).to(device)
         return self.actor(state).cpu().data.numpy().flatten()
 
-    def train(self, replay_buffer, batch_size=100):
+    def train(self, replay_buffer, batch_size: int = 100):
         self.total_it += 1
 
         # Sample replay buffer
@@ -147,14 +147,14 @@ class TD3(object):
             for param, target_param in zip(self.actor.parameters(), self.actor_target.parameters()):
                 target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
 
-    def save(self, filename):
+    def save(self, filename: str):
         torch.save(self.critic.state_dict(), filename + "_critic")
         torch.save(self.critic_optimizer.state_dict(), filename + "_critic_optimizer")
 
         torch.save(self.actor.state_dict(), filename + "_actor")
         torch.save(self.actor_optimizer.state_dict(), filename + "_actor_optimizer")
 
-    def load(self, filename):
+    def load(self, filename: str):
         self.critic.load_state_dict(torch.load(filename + "_critic"))
         self.critic_optimizer.load_state_dict(torch.load(filename + "_critic_optimizer"))
         self.critic_target = copy.deepcopy(self.critic)
