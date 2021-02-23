@@ -126,8 +126,15 @@ class TD3(object):
         current_Q1, current_Q2 = self.critic(state, action)
 
         # Compute critic loss
-        critic_loss = F.mse_loss(current_Q1, target_Q) + F.mse_loss(current_Q2, target_Q)
+        q1_loss = F.mse_loss(current_Q1, target_Q)
+        q2_loss = F.mse_loss(current_Q2, target_Q)
+        critic_loss = q1_loss + q2_loss
         if self.writer is not None:
+            self.writer.add_scalar("Q1", current_Q1, self.writer_iter)
+            self.writer.add_scalar("Q2", current_Q2, self.writer_iter)
+            self.writer.add_scalar("target_Q", target_Q, self.writer_iter)
+            self.writer.add_scalar("Q1_loss", q1_loss, self.writer_iter)
+            self.writer.add_scalar("Q2_loss", q2_loss, self.writer_iter)
             self.writer.add_scalar("critic_loss", critic_loss, self.writer_iter)
 
         # Optimize the critic
@@ -138,7 +145,7 @@ class TD3(object):
         # Delayed policy updates
         if self.total_it % self.policy_freq == 0:
 
-            # Compute actor losse
+            # Compute actor loss
             actor_loss = -self.critic.Q1(state, self.actor(state)).mean()
             if self.writer is not None:
                 self.writer.add_scalar("actor_loss", actor_loss, self.writer_iter)
