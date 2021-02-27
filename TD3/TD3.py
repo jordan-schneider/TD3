@@ -1,5 +1,6 @@
 import copy
-from typing import Optional
+import logging
+from typing import List, Optional, Sequence, Tuple, Type
 
 import torch
 import torch.nn as nn
@@ -12,55 +13,78 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # Paper: https://arxiv.org/abs/1802.09477
 
 
-class Actor(nn.Module):
-    def __init__(self, state_dim: int, action_dim: int, max_action: float):
-        super(Actor, self).__init__()
+def make_linear_layers(n_nodes: Sequence[int]) -> nn.ModuleList:
+    assert len(n_nodes) >= 2, "Must have at least an input and output node set."
+    return nn.ModuleList([nn.Linear(n_nodes[i], n_nodes[i + 1]) for i in range(len(n_nodes) - 1)])
 
-        self.l1 = nn.Linear(state_dim, 256)
-        self.l2 = nn.Linear(256, 256)
-        self.l3 = nn.Linear(256, action_dim)
+
+def relu_tanh_forward(x: torch.Tensor, layers: Sequence[nn.Module]) -> torch.Tensor:
+    out = x
+    for layer in layers[:-1]:
+        out = F.relu(layer(out))
+    out = torch.tanh(layers[-1](out))
+    return out
+
+
+class Actor(nn.Module):
+    def __init__(self, state_dim: int, action_dim: int, max_action: float, **kwargs):
+        super(Actor, self).__init__()
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.max_action = max_action
+
+    def forward(self, state) -> torch.Tensor:
+        raise NotImplementedError()
+
+
+class LinearActor(Actor, nn.Module):
+    def __init__(
+        self, state_dim: int, action_dim: int, max_action: float, layers: Sequence[int] = [256, 256]
+    ):
+        super(LinearActor, self).__init__(state_dim, action_dim, max_action)
+
+        layer_sizes = [state_dim] + list(layers) + [action_dim]
+        logging.debug(f"Actor layers sizes are {layer_sizes}")
+        self.layers = make_linear_layers(layer_sizes)
+        logging.debug(f"There are {len(self.layers)} layers.")
 
         self.max_action = max_action
 
-    def forward(self, state):
-        a = F.relu(self.l1(state))
-        a = F.relu(self.l2(a))
-        return self.max_action * torch.tanh(self.l3(a))
+    def forward(self, state) -> torch.Tensor:
+        return relu_tanh_forward(state, self.layers)
 
 
 class Critic(nn.Module):
-    def __init__(self, state_dim: int, action_dim: int):
+    def __init__(self, state_dim: int, action_dim: int, **kwargs):
         super(Critic, self).__init__()
+        self.state_dim = state_dim
+        self.action_dim = action_dim
 
-        # Q1 architecture
-        self.l1 = nn.Linear(state_dim + action_dim, 256)
-        self.l2 = nn.Linear(256, 256)
-        self.l3 = nn.Linear(256, 1)
+    def forward(self, state, action) -> Tuple[torch.Tensor, torch.Tensor]:
+        raise NotImplementedError()
 
-        # Q2 architecture
-        self.l4 = nn.Linear(state_dim + action_dim, 256)
-        self.l5 = nn.Linear(256, 256)
-        self.l6 = nn.Linear(256, 1)
+    def Q1(self, state, action) -> torch.Tensor:
+        raise NotImplementedError()
 
-    def forward(self, state, action):
+
+class LinearCritic(Critic):
+    def __init__(self, state_dim: int, action_dim: int, layers: Sequence[int] = [256, 256]):
+        super(LinearCritic, self).__init__(state_dim, action_dim)
+
+        self.q1_layers = make_linear_layers([state_dim + action_dim] + list(layers) + [1])
+        self.q2_layers = make_linear_layers([state_dim + action_dim] + list(layers) + [1])
+
+    def forward(self, state, action) -> Tuple[torch.Tensor, torch.Tensor]:
         sa = torch.cat([state, action], 1)
 
-        q1 = F.relu(self.l1(sa))
-        q1 = F.relu(self.l2(q1))
-        q1 = self.l3(q1)
+        q1 = relu_tanh_forward(sa, self.q1_layers)
+        q2 = relu_tanh_forward(sa, self.q2_layers)
 
-        q2 = F.relu(self.l4(sa))
-        q2 = F.relu(self.l5(q2))
-        q2 = self.l6(q2)
         return q1, q2
 
     def Q1(self, state, action):
         sa = torch.cat([state, action], 1)
-
-        q1 = F.relu(self.l1(sa))
-        q1 = F.relu(self.l2(q1))
-        q1 = self.l3(q1)
-        return q1
+        return relu_tanh_forward(sa, self.q1_layers)
 
 
 class TD3(object):
@@ -69,19 +93,24 @@ class TD3(object):
         state_dim: int,
         action_dim: int,
         max_action: float,
+        actor_type: Type[Actor] = LinearActor,
+        critic_type: Type[Critic] = LinearCritic,
+        actor_kwargs: dict = dict(),
+        critic_kwargs: dict = dict(),
         discount: float = 0.99,
         tau: float = 0.005,
         policy_noise: float = 0.2,
         noise_clip: float = 0.5,
         policy_freq: int = 2,
         writer: Optional[SummaryWriter] = None,
+        log_weight_period: int = int(1e3),
     ):
 
-        self.actor = Actor(state_dim, action_dim, max_action).to(device)
+        self.actor = actor_type(state_dim, action_dim, max_action, **actor_kwargs).to(device)
         self.actor_target = copy.deepcopy(self.actor)
         self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=3e-4)
 
-        self.critic = Critic(state_dim, action_dim).to(device)
+        self.critic = critic_type(state_dim, action_dim, **critic_kwargs).to(device)
         self.critic_target = copy.deepcopy(self.critic)
         self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=3e-4)
 
@@ -96,6 +125,8 @@ class TD3(object):
 
         self.writer = writer
         self.writer_iter = 0
+
+        self.log_weight_period = log_weight_period
 
     def select_action(self, state):
         state = torch.FloatTensor(state.reshape(1, -1)).to(device)
@@ -130,25 +161,27 @@ class TD3(object):
         q2_loss = F.mse_loss(current_Q2, target_Q)
         critic_loss = q1_loss + q2_loss
         if self.writer is not None:
-            self.writer.add_scalar("Q1", current_Q1, self.writer_iter)
-            self.writer.add_scalar("Q2", current_Q2, self.writer_iter)
-            self.writer.add_scalar("target_Q", target_Q, self.writer_iter)
-            self.writer.add_scalar("Q1_loss", q1_loss, self.writer_iter)
-            self.writer.add_scalar("Q2_loss", q2_loss, self.writer_iter)
-            self.writer.add_scalar("critic_loss", critic_loss, self.writer_iter)
+            self.writer.add_histogram("Critic/Q1/Value", current_Q1, self.writer_iter)
+            self.writer.add_histogram("Critic/Q2/Value", current_Q2, self.writer_iter)
+            self.writer.add_histogram("Critic/target_Q", target_Q, self.writer_iter)
+            self.writer.add_scalar("Critic/Q1/loss", q1_loss, self.writer_iter)
+            self.writer.add_scalar("Critic/Q/loss", q2_loss, self.writer_iter)
+            self.writer.add_scalar("Critic/loss", critic_loss, self.writer_iter)
 
         # Optimize the critic
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
         self.critic_optimizer.step()
 
+        if self.total_it % self.log_weight_period == 0:
+            self.log_critic()
+
         # Delayed policy updates
         if self.total_it % self.policy_freq == 0:
-
             # Compute actor loss
             actor_loss = -self.critic.Q1(state, self.actor(state)).mean()
             if self.writer is not None:
-                self.writer.add_scalar("actor_loss", actor_loss, self.writer_iter)
+                self.writer.add_scalar("Actor/loss", actor_loss, self.writer_iter)
 
             # Optimize the actor
             self.actor_optimizer.zero_grad()
@@ -163,7 +196,26 @@ class TD3(object):
 
             for param, target_param in zip(self.actor.parameters(), self.actor_target.parameters()):
                 target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
+
+            if self.total_it % self.log_weight_period == 0:
+                self.log_actor()
         self.writer_iter += 1
+
+    def log_actor(self):
+        if self.writer is None:
+            raise ValueError("Tensorboard writer not provided")
+
+        for i, layer in enumerate(self.actor.layers):
+            self.writer.add_histogram(f"Actor/W/{i}", layer.weight, self.writer_iter)
+
+    def log_critic(self):
+        if self.writer is None:
+            raise ValueError("Tensorboard writer not provided")
+        for i, layer in enumerate(self.critic.q1_layers):
+            self.writer.add_histogram(f"Critic/Q1/W/{i}", layer.weight, self.writer_iter)
+
+        for i, layer in enumerate(self.critic.q2_layers):
+            self.writer.add_histogram(f"Critic/Q2/W/{i}", layer.weight, self.writer_iter)
 
     def save(self, filename: str):
         torch.save(self.critic.state_dict(), filename + "_critic")
