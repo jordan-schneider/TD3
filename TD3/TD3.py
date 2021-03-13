@@ -195,6 +195,8 @@ class TD3(object):
         self.critic_target = copy.deepcopy(self.critic)
         self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=3e-4)
 
+        self.state_dim = state_dim
+        self.action_dim = action_dim
         self.max_action = max_action
         self.discount = discount
         self.tau = tau
@@ -320,10 +322,10 @@ class TD3(object):
 
 def load_td3(env: Env, filename: str, writer: Optional[SummaryWriter]) -> TD3:
     logging.info(f"Loading TD3 from {filename}")
-    explicit_args = pickle.load(open(filename + ".meta.pkl", "rb"))
+    explicit_args = pickle.load(open(str(filename) + ".meta.pkl", "rb"))
 
     # TODO(joschnei): Refactor this flattening logic to one place
-    state_dim = np.prod(env.observation_space.shape) + env.reward.shape[0]
+    state_dim = np.prod(env.observation_space.shape) + env.reward_weights.shape[0]
     action_dim = np.prod(env.action_space.shape)
     # TODO(joschnei): Clamp expects a float, but we should use the entire vector here.
     max_action = max(np.max(env.action_space.high), -np.min(env.action_space.low))

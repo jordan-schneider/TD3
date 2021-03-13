@@ -11,6 +11,7 @@ class ReplayBuffer(object):
     ):
         self.max_size = max_size
         self.ptr = 0
+        self.last_done = -1
         self.size = 0
 
         self.state = np.zeros((max_size, state_dim))
@@ -31,10 +32,12 @@ class ReplayBuffer(object):
         self.not_done[self.ptr] = 1.0 - done
 
         if self.writer is not None and bool(done):
-            last_done = np.argmax(self.not_done[: self.ptr - 1 : -1])
-            episode_return = np.mean(self.reward[last_done + 1 : self.ptr - 1])
+            last_episode_rewards = self.reward[self.last_done + 1 : self.ptr]
+            assert len(last_episode_rewards) == 50
+            episode_return = np.mean(last_episode_rewards)
             self.writer.add_scalar("return", episode_return, self.writer_iter)
             self.writer_iter += 1
+            self.last_done = ((self.ptr + 1) % self.max_size) - 1
 
         self.ptr = (self.ptr + 1) % self.max_size
         self.size = min(self.size + 1, self.max_size)
