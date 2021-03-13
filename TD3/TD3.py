@@ -1,10 +1,14 @@
 import copy
 import logging
+import pickle
 from typing import List, Optional, Sequence, Tuple, Type
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from gym.core import Env  # type: ignore
+from torch.nn.modules.container import ModuleList
 from torch.utils.tensorboard.writer import SummaryWriter
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -13,20 +17,54 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # Paper: https://arxiv.org/abs/1802.09477
 
 
-def make_linear_layers(n_nodes: Sequence[int]) -> nn.ModuleList:
+def make_linear_layers(n_nodes: Sequence[int], extra_input_dim: int = 0) -> nn.ModuleList:
+    """
+    n_nodes: Sequence of integers representing the number of hidden nodes at each layer
+    extra_input_dim: Additional input size for constructing densenet layers.
+    """
     assert len(n_nodes) >= 2, "Must have at least an input and output node set."
-    return nn.ModuleList([nn.Linear(n_nodes[i], n_nodes[i + 1]) for i in range(len(n_nodes) - 1)])
+
+    input_nodes = np.array(n_nodes[:-1])
+    input_nodes[1:] += extra_input_dim
+    output_nodes = n_nodes[1:]
+
+    return nn.ModuleList(
+        [nn.Linear(in_size, out_size) for in_size, out_size in zip(input_nodes, output_nodes)]
+    )
 
 
-def relu_tanh_forward(x: torch.Tensor, layers: Sequence[nn.Module]) -> torch.Tensor:
+def relu_forward(x: torch.Tensor, layers: ModuleList, dense: bool = False, skip_last: bool = False):
     out = x
-    for layer in layers[:-1]:
-        out = F.relu(layer(out))
+    if skip_last:
+        for layer in layers[:-2]:
+            out = F.relu(layer(out))
+            if dense:
+                out = torch.cat([out, x], 1)
+        out = F.relu(layers[-2](out))
+        out = layers[-1](out)
+    else:
+        for layer in layers[:-1]:
+            out = F.relu(layer(out))
+            if dense:
+                out = torch.cat([out, x], 1)
+        out = F.relu(layers[-1](out))
+    return out
+
+
+def relu_tanh_forward(x: torch.Tensor, layers: ModuleList, dense: bool = False) -> torch.Tensor:
+    out = relu_forward(x, layers[:-1], dense=dense, skip_last=False)
     out = torch.tanh(layers[-1](out))
     return out
 
 
+def get_layer_sizes(layers: ModuleList) -> List[Tuple[int, int]]:
+    sizes = [(layer.in_features, layer.out_features) for layer in layers]
+    return sizes
+
+
 class Actor(nn.Module):
+    layers: ModuleList
+
     def __init__(self, state_dim: int, action_dim: int, max_action: float, **kwargs):
         super(Actor, self).__init__()
         self.state_dim = state_dim
@@ -39,22 +77,33 @@ class Actor(nn.Module):
 
 class LinearActor(Actor, nn.Module):
     def __init__(
-        self, state_dim: int, action_dim: int, max_action: float, layers: Sequence[int] = [256, 256]
+        self,
+        state_dim: int,
+        action_dim: int,
+        max_action: float,
+        layers: Sequence[int] = [256, 256],
+        dense: bool = False,
     ):
         super(LinearActor, self).__init__(state_dim, action_dim, max_action)
 
-        layer_sizes = [state_dim] + list(layers) + [action_dim]
-        logging.debug(f"Actor layers sizes are {layer_sizes}")
-        self.layers = make_linear_layers(layer_sizes)
-        logging.debug(f"There are {len(self.layers)} layers.")
+        self.layers = make_linear_layers(
+            [state_dim] + list(layers), extra_input_dim=state_dim if dense else 0
+        )
+        self.layers.extend(make_linear_layers(n_nodes=[layers[-1], action_dim]))
+
+        logging.debug(f"Layer dimensions are {get_layer_sizes(self.layers)}")
 
         self.max_action = max_action
+        self.dense = dense
 
     def forward(self, state) -> torch.Tensor:
-        return relu_tanh_forward(state, self.layers)
+        return relu_tanh_forward(state, self.layers, dense=self.dense)
 
 
 class Critic(nn.Module):
+    q1_layers: ModuleList
+    q2_layers: ModuleList
+
     def __init__(self, state_dim: int, action_dim: int, **kwargs):
         super(Critic, self).__init__()
         self.state_dim = state_dim
@@ -68,23 +117,40 @@ class Critic(nn.Module):
 
 
 class LinearCritic(Critic):
-    def __init__(self, state_dim: int, action_dim: int, layers: Sequence[int] = [256, 256]):
+    def __init__(
+        self,
+        state_dim: int,
+        action_dim: int,
+        layers: Sequence[int] = [256, 256],
+        dense: bool = False,
+    ):
         super(LinearCritic, self).__init__(state_dim, action_dim)
+        self.dense = dense
+        extra_input_dim = state_dim + action_dim if dense else 0
+        self.q1_layers = make_linear_layers(
+            [state_dim + action_dim] + list(layers), extra_input_dim=extra_input_dim
+        )
+        self.q1_layers.extend(make_linear_layers([layers[-1], 1]))
 
-        self.q1_layers = make_linear_layers([state_dim + action_dim] + list(layers) + [1])
-        self.q2_layers = make_linear_layers([state_dim + action_dim] + list(layers) + [1])
+        self.q2_layers = make_linear_layers(
+            [state_dim + action_dim] + list(layers), extra_input_dim=extra_input_dim
+        )
+        self.q2_layers.extend(make_linear_layers([layers[-1], 1]))
+
+        logging.debug(f"Q1 layer dimensions are {get_layer_sizes(self.q1_layers)}")
+        logging.debug(f"Q2 layer dimensions are {get_layer_sizes(self.q2_layers)}")
 
     def forward(self, state, action) -> Tuple[torch.Tensor, torch.Tensor]:
         sa = torch.cat([state, action], 1)
 
-        q1 = relu_tanh_forward(sa, self.q1_layers)
-        q2 = relu_tanh_forward(sa, self.q2_layers)
+        q1 = relu_forward(sa, self.q1_layers, dense=self.dense, skip_last=True)
+        q2 = relu_forward(sa, self.q2_layers, dense=self.dense, skip_last=True)
 
         return q1, q2
 
     def Q1(self, state, action):
         sa = torch.cat([state, action], 1)
-        return relu_tanh_forward(sa, self.q1_layers)
+        return relu_forward(sa, self.q1_layers, dense=self.dense, skip_last=True)
 
 
 class TD3(object):
@@ -103,8 +169,23 @@ class TD3(object):
         noise_clip: float = 0.5,
         policy_freq: int = 2,
         writer: Optional[SummaryWriter] = None,
+        log_weight: bool = False,
         log_weight_period: int = int(1e3),
     ):
+        # Extremely cursed hack for preserving metadata for saving.
+        self.explicit_args = {
+            "actor_type": actor_type,
+            "critic_type": critic_type,
+            "actor_kwargs": actor_kwargs,
+            "critic_kwargs": critic_type,
+            "discount": discount,
+            "tau": tau,
+            "policy_noise": policy_noise,
+            "noise_clip": noise_clip,
+            "policy_freq": policy_freq,
+            "log_weight": log_weight,
+            "log_weight_period": log_weight_period,
+        }
 
         self.actor = actor_type(state_dim, action_dim, max_action, **actor_kwargs).to(device)
         self.actor_target = copy.deepcopy(self.actor)
@@ -126,6 +207,7 @@ class TD3(object):
         self.writer = writer
         self.writer_iter = 0
 
+        self.log_weight = log_weight
         self.log_weight_period = log_weight_period
 
     def select_action(self, state):
@@ -173,7 +255,7 @@ class TD3(object):
         critic_loss.backward()
         self.critic_optimizer.step()
 
-        if self.total_it % self.log_weight_period == 0:
+        if self.log_weight and self.total_it % self.log_weight_period == 0:
             self.log_critic()
 
         # Delayed policy updates
@@ -197,7 +279,7 @@ class TD3(object):
             for param, target_param in zip(self.actor.parameters(), self.actor_target.parameters()):
                 target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
 
-            if self.total_it % self.log_weight_period == 0:
+            if self.log_weight and self.total_it % self.log_weight_period == 0:
                 self.log_actor()
         self.writer_iter += 1
 
@@ -224,6 +306,8 @@ class TD3(object):
         torch.save(self.actor.state_dict(), filename + "_actor")
         torch.save(self.actor_optimizer.state_dict(), filename + "_actor_optimizer")
 
+        pickle.dump(self.explicit_args, open(filename + ".meta.pkl", "wb"))
+
     def load(self, filename: str):
         self.critic.load_state_dict(torch.load(filename + "_critic"))
         self.critic_optimizer.load_state_dict(torch.load(filename + "_critic_optimizer"))
@@ -232,3 +316,24 @@ class TD3(object):
         self.actor.load_state_dict(torch.load(filename + "_actor"))
         self.actor_optimizer.load_state_dict(torch.load(filename + "_actor_optimizer"))
         self.actor_target = copy.deepcopy(self.actor)
+
+
+def load_td3(env: Env, filename: str, writer: Optional[SummaryWriter]) -> TD3:
+    logging.info(f"Loading TD3 from {filename}")
+    explicit_args = pickle.load(open(filename + ".meta.pkl", "rb"))
+
+    # TODO(joschnei): Refactor this flattening logic to one place
+    state_dim = np.prod(env.observation_space.shape) + env.reward.shape[0]
+    action_dim = np.prod(env.action_space.shape)
+    # TODO(joschnei): Clamp expects a float, but we should use the entire vector here.
+    max_action = max(np.max(env.action_space.high), -np.min(env.action_space.low))
+
+    td3 = TD3(
+        state_dim=state_dim,
+        action_dim=action_dim,
+        max_action=max_action,
+        writer=writer,
+        **explicit_args,
+    )
+    td3.load(filename)
+    return td3
